@@ -11,7 +11,8 @@ def get_container_info(elem):
     return (None, None)
 
 MIDI_REF_CONFIG = {
-    "pdf": "../doc-inputs/midi-ref.pdf",
+    "pdf": "doc-inputs/jupx-midi-ref.pdf",
+    "output_map": "../sysex-maps/jupx.json",
     "sizes": {
         21: "title",
         14: "h1", # ex: "1. Data Reception"
@@ -27,7 +28,13 @@ MIDI_REF_CONFIG = {
         "h1": [
             "3. Parameter Address Map",
         ]
-    }
+    },
+    "port_names": [
+        "JUPITER-X"
+    ],
+    "ignore_port_names": [
+        "JUPITER-X JUPITER-X DAW CTRL"
+    ],
 }
 
 #### Table Parsing
@@ -77,6 +84,19 @@ def parse_bitmask(text):
     last_zero = "".rfind("0")
     p2 = 1 << (8 - last_zero)
     return p2 - 1
+
+def parse_num(str):
+    # Handle weird "L64 - 63R" panning case by mapping it to "-64 - 63"
+    if str[0] == "L":
+        return -int(str[1:])
+    elif str[-1] == "R":
+        return int(str[0:-1])
+    # Explicitly parse floats as floats
+    elif "." in str:
+        return float(str)
+    # And assume anything leftover is an int
+    else:
+        return int(str)
 
 def grok_midi_table(lines):
     """
@@ -234,16 +254,6 @@ def grok_midi_table(lines):
     flush_row()
     return result
 
-class MapChunk(object):
-    def __init__(self, name):
-        pass
-
-    def add_single(self, offset, name, type):
-        pass
-
-    def add_repeating(self, first_offset, last_offset, name, type):
-        pass
-
 class MapMaker(object):
     """
     Process a series of configuration files (currently hardcoded) in order
@@ -268,12 +278,19 @@ class MapMaker(object):
     """
     def __init__(self, configs):
         self.configs = configs
-        self.chunks_by_type = {}
+        self.type_chunks_by_type = {}
+        self.value_chunks_by_type = {}
 
         self.pending_table_type = None
         self.pending_table_lines = None
 
     def consider_text(self, text):
+        #print("** CONSIDERING:", text)
+        # In some cases there's some weird leading whitespace for the tables,
+        # let's get rid of that to avoid contaminating the regexps.  But we
+        # just want to eat a single space, not strip everything.
+        if text[0] == " " and (text[1] == "+" or text[1] == "|"):
+            text = text[1:]
         if RE_SNIFF_TABLE_HEADER.match(text):
             self.handle_table_header(text)
         elif RE_SNIFF_TABLE_ROW_SEP.match(text) or \
@@ -282,7 +299,66 @@ class MapMaker(object):
 
     def process_table(self, type, table_info):
         print("midi table:", type, "\n", json.dumps(table_info, indent=2))
-        pass
+        
+        if len(table_info["rows"]) < 0:
+            return
+        
+        table_kind = table_info["rows"][0]["kind"]
+        if table_kind == "type":
+            self.process_type_table(type, table_info)
+        else:
+            self.process_value_table(type, table_info)
+    
+    def process_type_table(self, type, table_info):
+        json_rows = self.type_chunks_by_type[type] = []
+        for row in table_info["rows"]:
+            json_row = {
+                "name": row["name"],
+                "first_offset_start": row["first_offset_start"],
+                "last_offset_start": row["last_offset_start"],
+                "type": row["type"],
+            }
+            if row["stride"] is not None:
+                json_row["stride"] = row["stride"]
+
+            json_rows.append(json_row)
+
+    def process_value_table(self, type, table_info):
+        json_rows = self.value_chunks_by_type[type] = []
+        for row in table_info["rows"]:
+            low, high = [parse_num(x) for x in row["discrete_range"].split(" - ")]
+
+            json_row = {
+                "name": row["name"],
+                "first_offset_start": row["first_offset_start"],
+                "last_offset_start": row["last_offset_start"],
+                "bitmask": row["bitmask"],
+                "discrete_range_low": low,
+                "discrete_range_high": high,
+            }
+
+            hvals = row["human_values"]
+
+            # Extract units if present
+            idx_brace_open = hvals.rfind("[")
+            if idx_brace_open != -1:
+                json_row["human_value_units"] = hvals[idx_brace_open+1:-1]
+                hvals = hvals[:idx_brace_open]
+            
+            if "," in hvals:
+                json_row["human_value_list"] = [x.strip() for x in hvals.split(",")]
+            elif "-" in hvals:
+                # XXX Actually, values are frequently represented as floats, but
+                # I'm not sure I actually saw any fractional values, so it's
+                # easiest to just stick with an int for now.
+                h_low, h_high = [parse_num(x) for x in hvals.split(" - ")]
+                json_row["human_value_base"] = h_low
+            else:
+                # This should probably be an empty string then.
+                if hvals != "":
+                    print("WARN: weird hval of", hvals)
+
+            json_rows.append(json_row)
 
     def flush_table(self):
         table_info = grok_midi_table(self.pending_table_lines)
@@ -294,6 +370,7 @@ class MapMaker(object):
     def handle_table_header(self, text):
         if self.pending_table_lines:
             self.flush_table()
+
         m = RE_SNIFF_TABLE_HEADER.match(text)
         type = m.group(1)
         self.pending_table_type = type
@@ -329,10 +406,18 @@ class MapMaker(object):
         if found_end:
             self.flush_table()
 
+    def prepare_for_config(self, config):
+        self.pending_table_type = "ROOT"
+        self.pending_table_lines = None
+
+        self.type_chunks_by_type = {}
+        self.value_chunks_by_type = {}
+
     def process_config(self, config):
         top_margin = config["margins"]["top"]
         bottom_margin = config["margins"]["bottom"]
         for page_layout in extract_pages(config["pdf"]):
+            stuff_in_page = []
             for element in page_layout:
                 if isinstance(element, LTTextContainer):
                     # ignore page details in the margins (title, page numbers)
@@ -349,12 +434,42 @@ class MapMaker(object):
                     if tag != "text":
                         print("page", page_layout.pageid, "font", fontname, "size", size, "bbox", element.bbox)
                         print(tag, element.get_text())
+                        continue
+
+                    # If we think the text is in the 2nd column, effectively add
+                    # a y offset of the entire first column's height.
+                    col_boost = 0
+                    if element.x0 >= 300:
+                        col_boost = top_margin
+
+                    stuff_in_page.append({
+                        # we want the sort order to assume 2 columns, placing
+                        # things in order of scanning down the first column,
+                        # then the second.
+                        "sort_key": (top_margin - element.y0) + col_boost,
+                        "text": element.get_text()
+                    })
                     
-                    self.consider_text(element.get_text())
+            stuff_in_page.sort(key=lambda x: x["sort_key"])
+            for thing in stuff_in_page:
+                self.consider_text(thing["text"])
+    
+    def finish_config(self, config):
+        aggr_dict = {
+            "port_names": config["port_names"],
+            "ignore_port_names": config["ignore_port_names"],
+            "type_entries": self.type_chunks_by_type,
+            "value_entries": self.value_chunks_by_type,
+        }
+
+        with open(config["output_map"], "w") as f:
+            json.dump(aggr_dict, f, indent=2)
 
     def process_all(self):
         for config in self.configs:
+            self.prepare_for_config(config)
             self.process_config(config)
+            self.finish_config(config)
 
 if __name__ == "__main__":
     maker = MapMaker([MIDI_REF_CONFIG])
