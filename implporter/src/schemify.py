@@ -12,6 +12,12 @@ def get_container_info(elem):
                 return (char.fontname, char.size)
     return (None, None)
 
+
+def get_tag_from_size(siz, config, error_margin=0.3):
+    for k, v in config['sizes'].items():
+        if abs(k - siz) < error_margin:
+            return v
+
 MIDI_REF_CONFIG = {
     "pdf": "doc-inputs/jupx-midi-ref.pdf",
     "output_map": "../sysex-maps/jupx.json",
@@ -428,7 +434,7 @@ class MapMaker(object):
 
                     # attempt to map boxes based on the size of their contents
                     (fontname, size) = get_container_info(element)
-                    tag = config["sizes"].get(size)
+                    tag = get_tag_from_size(size, config)
                     if tag is None:
                         continue
 
