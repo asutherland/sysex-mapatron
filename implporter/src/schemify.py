@@ -293,17 +293,26 @@ class MapMaker(object):
         self.pending_table_lines = None
 
     def consider_text(self, text):
-        #print("** CONSIDERING:", text)
+        # print("** CONSIDERING:", text)
         # In some cases there's some weird leading whitespace for the tables,
         # let's get rid of that to avoid contaminating the regexps.  But we
         # just want to eat a single space, not strip everything.
+        if len(text) <= 1:
+            return
         if text[0] == " " and (text[1] == "+" or text[1] == "|"):
             text = text[1:]
+
         if RE_SNIFF_TABLE_HEADER.match(text):
             self.handle_table_header(text)
         elif RE_SNIFF_TABLE_ROW_SEP.match(text) or \
              RE_SNIFF_VAL_TABLE.match(text):
             self.handle_table(text)
+        else:
+            # maybe we need to split the text in two sets of lines
+            if '\n' in text:
+                h, t = text.split('\n', 1)
+                self.consider_text(h)
+                self.consider_text(t)
 
     def process_table(self, type, table_info):
         print("midi table:", type, "\n", json.dumps(table_info, indent=2))
@@ -436,12 +445,14 @@ class MapMaker(object):
                     (fontname, size) = get_container_info(element)
                     tag = get_tag_from_size(size, config)
                     if tag is None:
+                        print(f"skipping unknown stuff of size {size} and font {fontname}", element)
                         continue
 
                     # Show progress.
+                    tx = element.get_text()
                     if tag != "text":
-                        print("page", page_layout.pageid, "font", fontname, "size", size, "bbox", element.bbox)
-                        print(tag, element.get_text())
+                        #print("page", page_layout.pageid, "font", fontname, "size", size, "bbox", element.bbox)
+                        print(tag, tx)
                         continue
 
                     # If we think the text is in the 2nd column, effectively add
@@ -455,7 +466,7 @@ class MapMaker(object):
                         # things in order of scanning down the first column,
                         # then the second.
                         "sort_key": (top_margin - element.y0) + col_boost,
-                        "text": element.get_text()
+                        "text": tx,
                     })
                     
             stuff_in_page.sort(key=lambda x: x["sort_key"])
