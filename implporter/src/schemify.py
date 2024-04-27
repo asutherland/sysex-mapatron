@@ -5,6 +5,8 @@ import re
 
 def get_container_info(elem):
     for text_line in elem:
+        if isinstance(text_line, LTChar):
+            text_line = [text_line]
         for char in text_line:
             if isinstance(char, LTChar):
                 return (char.fontname, char.size)
