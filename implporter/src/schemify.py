@@ -5,10 +5,18 @@ import re
 
 def get_container_info(elem):
     for text_line in elem:
+        if isinstance(text_line, LTChar):
+            text_line = [text_line]
         for char in text_line:
             if isinstance(char, LTChar):
                 return (char.fontname, char.size)
     return (None, None)
+
+
+def get_tag_from_size(siz, config, error_margin=0.3):
+    for k, v in config['sizes'].items():
+        if abs(k - siz) < error_margin:
+            return v
 
 MIDI_REF_CONFIG = {
     "pdf": "doc-inputs/jupx-midi-ref.pdf",
@@ -280,27 +288,37 @@ class MapMaker(object):
         self.configs = configs
         self.type_chunks_by_type = {}
         self.value_chunks_by_type = {}
-
+        self.sizes_by_type = {}
         self.pending_table_type = None
         self.pending_table_lines = None
+        self.pending_table_size = None
 
     def consider_text(self, text):
-        #print("** CONSIDERING:", text)
+        # print("** CONSIDERING:", text)
         # In some cases there's some weird leading whitespace for the tables,
         # let's get rid of that to avoid contaminating the regexps.  But we
         # just want to eat a single space, not strip everything.
+        if len(text) <= 1:
+            return
         if text[0] == " " and (text[1] == "+" or text[1] == "|"):
             text = text[1:]
+
         if RE_SNIFF_TABLE_HEADER.match(text):
             self.handle_table_header(text)
         elif RE_SNIFF_TABLE_ROW_SEP.match(text) or \
              RE_SNIFF_VAL_TABLE.match(text):
             self.handle_table(text)
+        else:
+            # maybe we need to split the text in two sets of lines
+            if '\n' in text:
+                h, t = text.split('\n', 1)
+                self.consider_text(h)
+                self.consider_text(t)
 
     def process_table(self, type, table_info):
         print("midi table:", type, "\n", json.dumps(table_info, indent=2))
         
-        if len(table_info["rows"]) < 0:
+        if not len(table_info["rows"]):
             return
         
         table_kind = table_info["rows"][0]["kind"]
@@ -310,7 +328,9 @@ class MapMaker(object):
             self.process_value_table(type, table_info)
     
     def process_type_table(self, type, table_info):
-        json_rows = self.type_chunks_by_type[type] = []
+
+        json_rows = self.type_chunks_by_type.get(type, [])
+        self.type_chunks_by_type[type] = json_rows
         for row in table_info["rows"]:
             json_row = {
                 "name": row["name"],
@@ -324,7 +344,11 @@ class MapMaker(object):
             json_rows.append(json_row)
 
     def process_value_table(self, type, table_info):
-        json_rows = self.value_chunks_by_type[type] = []
+        if 'total' in table_info:
+            self.sizes_by_type[type] = table_info['total']
+            print("set pending table size", table_info['total'])
+        json_rows = self.value_chunks_by_type.get(type, [])
+        self.value_chunks_by_type[type] = json_rows
         for row in table_info["rows"]:
             low, high = [parse_num(x) for x in row["discrete_range"].split(" - ")]
 
@@ -338,7 +362,7 @@ class MapMaker(object):
             }
 
             hvals = row["human_values"]
-
+            total_size = row
             # Extract units if present
             idx_brace_open = hvals.rfind("[")
             if idx_brace_open != -1:
@@ -366,6 +390,7 @@ class MapMaker(object):
 
         self.pending_table_type = None
         self.pending_table_lines = None
+        self.pending_table_size = None
 
     def handle_table_header(self, text):
         if self.pending_table_lines:
@@ -426,14 +451,16 @@ class MapMaker(object):
 
                     # attempt to map boxes based on the size of their contents
                     (fontname, size) = get_container_info(element)
-                    tag = config["sizes"].get(size)
+                    tag = get_tag_from_size(size, config)
                     if tag is None:
+                        print(f"skipping unknown stuff of size {size} and font {fontname}", element)
                         continue
 
                     # Show progress.
+                    tx = element.get_text()
                     if tag != "text":
-                        print("page", page_layout.pageid, "font", fontname, "size", size, "bbox", element.bbox)
-                        print(tag, element.get_text())
+                        #print("page", page_layout.pageid, "font", fontname, "size", size, "bbox", element.bbox)
+                        print(tag, tx)
                         continue
 
                     # If we think the text is in the 2nd column, effectively add
@@ -447,7 +474,7 @@ class MapMaker(object):
                         # things in order of scanning down the first column,
                         # then the second.
                         "sort_key": (top_margin - element.y0) + col_boost,
-                        "text": element.get_text()
+                        "text": tx,
                     })
                     
             stuff_in_page.sort(key=lambda x: x["sort_key"])
@@ -460,6 +487,7 @@ class MapMaker(object):
             "ignore_port_names": config["ignore_port_names"],
             "type_entries": self.type_chunks_by_type,
             "value_entries": self.value_chunks_by_type,
+            "size_of_types": self.sizes_by_type,
         }
 
         with open(config["output_map"], "w") as f:
